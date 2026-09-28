@@ -68,6 +68,16 @@ export const MAX_STEPS_3D = 600;
 export const CAPTURE_R = RS * 1.0001;
 
 /**
+ * Accretion disk radii, in units of rs.
+ *
+ * The disk is an infinitely thin annulus in the y = 0 plane -- there is no
+ * vertical extent to intersect, only a plane crossing to detect. These match
+ * uploadDiskUBO() in the reference (r1 = 2.2 r_s, r2 = 5.2 r_s).
+ */
+export const DISK_R1 = 2.2;
+export const DISK_R2 = 5.2;
+
+/**
  * Affine step bounds, in units of rs.
  *
  * The step scales with r because the interesting structure of the field lives
@@ -214,6 +224,43 @@ export function planePosition(ray: PlaneRay): Vec3 {
     ray.r * (c * ray.e1[1] + s * ray.e2[1]),
     ray.r * (c * ray.e1[2] + s * ray.e2[2]),
   ];
+}
+
+/**
+ * Cylindrical radius at which the segment `prev -> next` crosses the disk, or
+ * -1 when it does not hit the annulus.
+ *
+ * This is the CPU twin of the plane-crossing test inside geodesic3d.wgsl. The
+ * march loop rebuilds the cartesian position every step, and this decides
+ * whether the segment passed through the disk: a sign change in y brackets the
+ * crossing, linear interpolation locates it independently of the adaptive step
+ * length, and the annulus test rejects the crossing when it lands outside
+ * [DISK_R1, DISK_R2].
+ *
+ * It lives here rather than being inlined only in the shader because vitest
+ * cannot execute WGSL -- the sign test and the interpolation are exactly the
+ * sort of thing that silently inverts, and the tests below are the evidence
+ * that both copies do the same thing.
+ *
+ * Returns the 3D radius of the crossing point (equal to the cylindrical radius
+ * up to floating-point noise, since the point lies in the plane) so the caller
+ * can shade it.
+ */
+export function diskCrossing(prev: Vec3, next: Vec3): number {
+  // Strict inequality: touching the plane without passing through it (one
+  // endpoint exactly on it) is not a crossing, and matches `prev.y * next.y < 0`.
+  if (prev[1] * next[1] >= 0) return -1;
+
+  const t = prev[1] / (prev[1] - next[1]);
+  const hit: Vec3 = [
+    prev[0] + t * (next[0] - prev[0]),
+    prev[1] + t * (next[1] - prev[1]),
+    prev[2] + t * (next[2] - prev[2]),
+  ];
+
+  const rho = Math.hypot(hit[0], hit[2]);
+  if (rho < DISK_R1 || rho > DISK_R2) return -1;
+  return Math.hypot(hit[0], hit[1], hit[2]);
 }
 
 /**

@@ -8,12 +8,32 @@ import { createGpuRenderer, type CameraState, type GpuRenderer } from '../render
  * whose ray falls in come back black, which is the shadow; pixels whose ray
  * escapes sample the procedural sky along the ray's final velocity direction,
  * so the background visibly bends around the hole.
+ *
+ * Phase 3 adds two things to that image: an accretion disk (the annulus in the
+ * y = 0 plane the march now tests for crossings) and the Flamm-paraboloid
+ * wireframe, overlaid by a third render pass.
  */
 
 /** Starting distance from the hole, in rs. Far enough that the shadow is small. */
 const DEFAULT_DIST = 40;
 const DEFAULT_AZIMUTH = -0.55;
-const DEFAULT_ELEVATION = 0.18;
+
+/**
+ * Elevation above the equatorial plane, radians.
+ *
+ * The reference starts at exactly 90 degrees of elevation in its own
+ * convention, which puts its camera *in* the disk plane -- an edge-on view
+ * where both the disk and the curvature sheet collapse to a line. At 0.18 rad
+ * ours was only 10 degrees, enough to flatten the lattice to a thin band.
+ * 0.5 rad (about 29 degrees) opens the annulus into a readable ellipse.
+ *
+ * The shadow's *intrinsic* silhouette does not depend on elevation -- it is
+ * spherical -- but the shadow we can see does: the near side of the disk
+ * occludes it, and how much it covers depends on the viewing angle. That is
+ * also why the self-check's SHADOW_DIAMETER moved from 144 to 118 when this
+ * was raised; see the note there.
+ */
+const DEFAULT_ELEVATION = 0.5;
 
 /** Vertical field of view. The shadow must stay on screen at the default distance. */
 const FOV_Y = (40 * Math.PI) / 180;
@@ -133,6 +153,17 @@ export async function createLensing3d(
         void renderer.measureShadowDiameter().then((diameter) => {
           // Single greppable line: the headless harness reads this from the
           // browser console instead of parsing a PNG.
+          //
+          // This measures the *visible* black run on the centre row of the
+          // compute texture, not the capture silhouette. Before the disk
+          // existed it was that silhouette (144 px against 147 predicted).
+          // Now the disk's near side covers part of it -- and, per the
+          // reference's loop order, a photon that crosses the disk annulus
+          // before it reaches the capture radius is reported as disk rather
+          // than as captured, exactly as geodesic.comp's `hitDisk` break does.
+          // So 118 px is the expected figure, not a regression: it is roughly
+          // the disk's inner edge (2.2 rs) projected at distance 40 rs, which
+          // is 121 px by the same arithmetic the 147 was derived from.
           console.log(`SHADOW_DIAMETER=${diameter}`);
         });
       }

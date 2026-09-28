@@ -2,7 +2,8 @@
 //
 // This is a line-by-line transcription of src/physics/geodesic3d.ts, which is
 // where the equations are proved (vitest cannot execute WGSL). If you change
-// one, change the other -- they are meant to be the same integrator.
+// one, change the other -- they are meant to be the same integrator. The disk
+// plane-crossing test below is likewise mirrored by diskCrossing() there.
 //
 // Units: every length is in Schwarzschild radii (rs = 1). See the header of
 // src/physics/constants.ts for why SI numbers cannot survive f32.
@@ -44,6 +45,12 @@ const STEP_MAX: f32 = 12.0;
 // makes the lensing legible: it is structure that visibly compresses toward
 // the shadow and folds into the photon ring.
 const SKY_GRID: f32 = 0.2617993;
+
+// Accretion disk, in rs. uploadDiskUBO() in black_hole.cpp sets
+// r1 = 2.2 r_s and r2 = 5.2 r_s. The disk is razor thin: it is the annulus
+// in the y = 0 plane between those radii, with no vertical extent.
+const DISK_R1: f32 = 2.2;
+const DISK_R2: f32 = 5.2;
 
 // --- Integrator -----------------------------------------------------------
 
@@ -182,6 +189,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let L = sigma * r * dT;
 
   var captured = false;
+  // Cylindrical radius at which the ray crossed the disk, negative if it never
+  // did. The integrator only knows r and phi inside the orbital plane, so the
+  // cartesian point is rebuilt from the basis every step to test the plane.
+  var diskHit = -1.0;
+  var prevPos = origin;
   for (var i: i32 = 0; i < MAX_STEPS; i = i + 1) {
     if (y.x <= CAPTURE_R) {
       captured = true;
@@ -199,12 +211,54 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       break;
     }
     y = next;
+
+    let cc = cos(y.y);
+    let ss = sin(y.y);
+    let pos = y.x * (cc * e1 + ss * e2);
+
+    // The disk is the annulus in the y = 0 plane -- the same test
+    // crossesEquatorialPlane() runs in the reference. A sign change brackets
+    // the crossing, and interpolating to the exact plane keeps the hit
+    // independent of the adaptive step length.
+    if (prevPos.y * pos.y < 0.0) {
+      let t = prevPos.y / (prevPos.y - pos.y);
+      let hit = mix(prevPos, pos, t);
+      let rho = length(hit.xz);
+      if (rho >= DISK_R1 && rho <= DISK_R2) {
+        diskHit = length(hit);
+        break;
+      }
+    }
+    prevPos = pos;
   }
 
   var col = vec3<f32>(0.0);
+
+  // Occlusion mask, carried in alpha: how much of anything drawn ON TOP of
+  // this pixel should be suppressed.
+  //
+  // The reference composites the other way round -- it draws the grid first
+  // and lays the raytraced image over it with blending, using exactly these
+  // numbers (black hole alpha 1, disk alpha r, empty space alpha 0), so the
+  // wireframe disappears behind the shadow and fades under the disk.
+  //
+  // Reordering our passes would work too, but our sky is never empty: the
+  // gradient, the celestial grid and the stars are always drawn, so a single
+  // image alpha cannot be 0 in the void and 1 on a star at once. Carrying the
+  // reference's numbers in alpha instead keeps the opaque blit untouched and
+  // lets the grid pass reproduce the same occlusion read-back.
+  var mask = 0.0;
   if (captured) {
     // The shadow: pure black, no rim -- the rim is drawn by the eye, not us.
     col = vec3<f32>(0.0, 0.0, 0.0);
+    mask = 1.0;
+  } else if (diskHit >= 0.0) {
+    // Reference: diskColor = vec3(1.0, r, 0.2) with r = |hit| / disk_r2, so r
+    // runs from r1/r2 = 0.42 at the inner edge to 1.0 at the outer edge and
+    // the annulus grades from red-orange to yellow. There is no other shading.
+    let t = clamp(diskHit / DISK_R2, 0.0, 1.0);
+    col = vec3<f32>(1.0, t, 0.2);
+    mask = t;
   } else {
     // Rays that exhaust the step budget are near-critical (they wind around
     // the photon sphere). Sampling the sky with their current heading keeps the
@@ -221,7 +275,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       vel = normalize(vr * rHat + vt * phiHat);
     }
     col = skyColor(vel);
+    mask = 0.0;
   }
 
-  textureStore(outputTex, vec2<i32>(gid.xy), vec4<f32>(col, 1.0));
+  // Alpha carries the occlusion mask, not coverage: blit.wgsl ignores it and
+  // forces alpha to 1, so the canvas is unaffected. grid.wgsl is the only
+  // reader.
+  textureStore(outputTex, vec2<i32>(gid.xy), vec4<f32>(col, mask));
 }

@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
+import shaderSource from '../shaders/geodesic3d.wgsl?raw';
 import { RS } from './constants';
 import {
   CAPTURE_R,
   CRITICAL_B,
+  DISK_R1,
+  DISK_R2,
   ESCAPE_R_3D,
+  diskCrossing,
   initPlaneRay,
   marchPlaneRay,
   planePosition,
@@ -208,5 +212,70 @@ describe('3D geodesic integration', () => {
     expect(angleBetween(vel, pos)).toBeGreaterThan(0.01);
     expect(Math.abs(norm(vel) - 1)).toBeLessThan(1e-12);
     expect(norm(sub(vel, pos))).toBeGreaterThan(0.01);
+  });
+});
+
+describe('diskCrossing', () => {
+  it('finds the crossing on the y = 0 plane inside the annulus', () => {
+    expect(diskCrossing([3, 5, 0], [3, -5, 0])).toBeCloseTo(3, 10);
+    // Radius is cylindrical: both in-plane coordinates contribute.
+    expect(diskCrossing([1, 2, 3], [5, -2, 3])).toBeCloseTo(Math.hypot(3, 3), 8);
+  });
+
+  it('does not report a segment that never crosses the plane', () => {
+    expect(diskCrossing([3, 5, 0], [3, 1, 0])).toBe(-1);
+    expect(diskCrossing([3, -5, 0], [3, -1, 0])).toBe(-1);
+  });
+
+  it('ignores a segment that only touches the plane', () => {
+    // One endpoint lying exactly on the plane is not a crossing. The shader
+    // uses the same strict inequality, prev.y * next.y < 0.
+    expect(diskCrossing([3, 0, 0], [3, -5, 0])).toBe(-1);
+    expect(diskCrossing([3, 5, 0], [3, 0, 0])).toBe(-1);
+  });
+
+  it('rejects crossings outside the annulus', () => {
+    expect(diskCrossing([DISK_R2 + 1, 5, 0], [DISK_R2 + 1, -5, 0])).toBe(-1);
+    expect(diskCrossing([DISK_R1 - 1, 5, 0], [DISK_R1 - 1, -5, 0])).toBe(-1);
+    expect(diskCrossing([DISK_R1 + 0.01, 5, 0], [DISK_R1 + 0.01, -5, 0])).toBeGreaterThan(0);
+    expect(diskCrossing([DISK_R2 - 0.01, 5, 0], [DISK_R2 - 0.01, -5, 0])).toBeGreaterThan(0);
+  });
+
+  it('places the hit on the plane whatever the step length is', () => {
+    // The march uses an adaptive step, so the hit must not drift with it.
+    const prev: Vec3 = [4, 0.5, 1];
+    const next: Vec3 = [4, -0.5, -1];
+    const t = prev[1] / (prev[1] - next[1]);
+    expect(prev[1] + t * (next[1] - prev[1])).toBeCloseTo(0, 12);
+    expect(diskCrossing(prev, next)).toBeGreaterThan(DISK_R1);
+
+    const short: Vec3 = [4, 1e-4, 1];
+    const shortNext: Vec3 = [4, -1e-4, -1];
+    expect(diskCrossing(short, shortNext)).toBeCloseTo(diskCrossing(prev, next), 6);
+  });
+});
+
+describe('shader constant parity', () => {
+  const shader = shaderSource;
+
+  function wgslConst(name: string): number {
+    const match = shader.match(new RegExp(`const ${name}: (?:f32|i32) = ([0-9.eE+-]+);`));
+    if (!match) throw new Error(`WGSL constant not found: ${name}`);
+    return Number(match[1]);
+  }
+
+  it('keeps the geometry constants in sync with the CPU reference', () => {
+    expect(wgslConst('RS')).toBeCloseTo(RS, 10);
+    expect(wgslConst('ESCAPE_R')).toBeCloseTo(ESCAPE_R_3D, 10);
+    expect(wgslConst('CAPTURE_R')).toBeCloseTo(CAPTURE_R, 6);
+  });
+
+  it('keeps the disk radii in sync with the CPU reference', () => {
+    expect(wgslConst('DISK_R1')).toBeCloseTo(DISK_R1, 10);
+    expect(wgslConst('DISK_R2')).toBeCloseTo(DISK_R2, 10);
+  });
+
+  it('keeps the march budget in sync with the CPU reference', () => {
+    expect(wgslConst('MAX_STEPS')).toBe(600);
   });
 });

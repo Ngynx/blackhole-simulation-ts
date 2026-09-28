@@ -1,17 +1,25 @@
 import blitCode from '../shaders/blit.wgsl?raw';
 import geodesicCode from '../shaders/geodesic3d.wgsl?raw';
+import gridCode from '../shaders/grid.wgsl?raw';
+import { buildFlammMesh } from '../physics/flamm';
 import { configureCanvasContext, resizeCanvasToDisplaySize } from './webgpu';
+import { buildViewProjection } from './viewProjection';
 
 /**
  * GPU renderer for the 3D lensing mode.
  *
- * Two pipelines, one canvas:
+ * Three passes, one canvas:
  *   1. compute  -- `geodesic3d.wgsl`, one thread per pixel, writes an
  *      rgba8unorm storage texture;
- *   2. render   -- `blit.wgsl`, copies that texture onto the canvas.
+ *   2. render   -- `blit.wgsl`, copies that texture onto the canvas;
+ *   3. render   -- `grid.wgsl`, overlays the Flamm-paraboloid wireframe.
  *
  * The storage texture is recreated whenever the canvas resizes, because a
  * WebGPU texture has a fixed size and there is no way to scale it in place.
+ *
+ * Pass 3 is deliberately separate from the ray march: the reference draws the
+ * curvature sheet as a translucent overlay in screen space, so it is not
+ * lensed. It loads what pass 2 stored and blends on top.
  */
 
 /** Everything the compute shader needs to place a ray. Packed as 4 vec4s. */
@@ -64,6 +72,7 @@ export async function createGpuRenderer(
   device.pushErrorScope('validation');
   const geodesicModule = device.createShaderModule({ label: 'geodesic3d', code: geodesicCode });
   const blitModule = device.createShaderModule({ label: 'blit', code: blitCode });
+  const gridModule = device.createShaderModule({ label: 'grid', code: gridCode });
 
   const computePipeline = device.createComputePipeline({
     label: 'geodesic3d',
@@ -79,6 +88,37 @@ export async function createGpuRenderer(
     primitive: { topology: 'triangle-list' },
   });
 
+  // Alpha blending so the wireframe reads as translucent, exactly the
+  // alpha = 0.7 the reference's grid.frag asks for.
+  const gridPipeline = device.createRenderPipeline({
+    label: 'grid',
+    layout: 'auto',
+    vertex: {
+      module: gridModule,
+      entryPoint: 'vs',
+      buffers: [
+        {
+          arrayStride: 12,
+          attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }],
+        },
+      ],
+    },
+    fragment: {
+      module: gridModule,
+      entryPoint: 'fs',
+      targets: [
+        {
+          format: presentationFormat,
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          },
+        },
+      ],
+    },
+    primitive: { topology: 'line-list' },
+  });
+
   const pipelineError = await device.popErrorScope();
   if (pipelineError) {
     throw new Error(`WebGPU pipeline creation failed: ${pipelineError.message}`);
@@ -89,17 +129,54 @@ export async function createGpuRenderer(
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
+  // Uploaded with mappedAtCreation so no staging buffer is needed: the mesh
+  // is static, built once on the CPU.
+  const mesh = buildFlammMesh();
+  const gridVertexBuffer = device.createBuffer({
+    label: 'grid-vertices',
+    size: mesh.positions.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true,
+  });
+  new Float32Array(gridVertexBuffer.getMappedRange()).set(mesh.positions);
+  gridVertexBuffer.unmap();
+
+  const gridIndexBuffer = device.createBuffer({
+    label: 'grid-indices',
+    size: mesh.indices.byteLength,
+    usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true,
+  });
+  new Uint16Array(gridIndexBuffer.getMappedRange()).set(mesh.indices);
+  gridIndexBuffer.unmap();
+
+  const gridUniformBuffer = device.createBuffer({
+    label: 'grid-view-proj',
+    size: 64,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
   const cameraUniforms = new Float32Array(CAMERA_FLOATS);
 
   let texture: GPUTexture | null = null;
   let computeBindGroup: GPUBindGroup | null = null;
   let blitBindGroup: GPUBindGroup | null = null;
+  // Recreated with the other bind groups: it also references the storage
+  // texture, which is destroyed and rebuilt on every resize.
+  let gridBindGroup: GPUBindGroup | null = null;
   let width = 0;
   let height = 0;
 
   function ensureTargets(): boolean {
     const size = resizeCanvasToDisplaySize(canvas);
-    if (size.width === width && size.height === height && texture && computeBindGroup && blitBindGroup) {
+    if (
+      size.width === width &&
+      size.height === height &&
+      texture &&
+      computeBindGroup &&
+      blitBindGroup &&
+      gridBindGroup
+    ) {
       return true;
     }
 
@@ -113,16 +190,24 @@ export async function createGpuRenderer(
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
     });
 
+    const view = texture.createView();
     computeBindGroup = device.createBindGroup({
       layout: computePipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: cameraBuffer } },
-        { binding: 1, resource: texture.createView() },
+        { binding: 1, resource: view },
       ],
     });
     blitBindGroup = device.createBindGroup({
       layout: renderPipeline.getBindGroupLayout(0),
-      entries: [{ binding: 0, resource: texture.createView() }],
+      entries: [{ binding: 0, resource: view }],
+    });
+    gridBindGroup = device.createBindGroup({
+      layout: gridPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: gridUniformBuffer } },
+        { binding: 1, resource: view },
+      ],
     });
     return true;
   }
@@ -143,10 +228,11 @@ export async function createGpuRenderer(
 
     render(camera: CameraState) {
       ensureTargets();
-      if (!texture || !computeBindGroup || !blitBindGroup) return;
+      if (!texture || !computeBindGroup || !blitBindGroup || !gridBindGroup) return;
 
       packCamera(camera);
       device.queue.writeBuffer(cameraBuffer, 0, cameraUniforms);
+      device.queue.writeBuffer(gridUniformBuffer, 0, buildViewProjection(camera));
 
       const encoder = device.createCommandEncoder();
 
@@ -156,10 +242,14 @@ export async function createGpuRenderer(
       computePass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
       computePass.end();
 
+      // Fetched once and reused: two passes must target the same view, or the
+      // overlay would draw onto a different texture than the blit filled.
+      const target = context.getCurrentTexture().createView();
+
       const renderPass = encoder.beginRenderPass({
         colorAttachments: [
           {
-            view: context.getCurrentTexture().createView(),
+            view: target,
             clearValue: { r: 0, g: 0, b: 0, a: 1 },
             loadOp: 'clear',
             storeOp: 'store',
@@ -170,6 +260,19 @@ export async function createGpuRenderer(
       renderPass.setBindGroup(0, blitBindGroup);
       renderPass.draw(3);
       renderPass.end();
+
+      // Overlay pass: load what the blit stored, then blend the wireframe on
+      // top. No depth attachment, so every line wins -- the reference has no
+      // depth test either, which is why the sheet can be drawn over the hole.
+      const gridPass = encoder.beginRenderPass({
+        colorAttachments: [{ view: target, loadOp: 'load', storeOp: 'store' }],
+      });
+      gridPass.setPipeline(gridPipeline);
+      gridPass.setBindGroup(0, gridBindGroup);
+      gridPass.setVertexBuffer(0, gridVertexBuffer);
+      gridPass.setIndexBuffer(gridIndexBuffer, 'uint16');
+      gridPass.drawIndexed(mesh.indices.length);
+      gridPass.end();
 
       device.queue.submit([encoder.finish()]);
     },
@@ -241,6 +344,9 @@ export async function createGpuRenderer(
     destroy() {
       texture?.destroy();
       cameraBuffer.destroy();
+      gridVertexBuffer.destroy();
+      gridIndexBuffer.destroy();
+      gridUniformBuffer.destroy();
     },
   };
 }
