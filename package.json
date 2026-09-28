@@ -1,0 +1,20 @@
+{
+  "name": "black-hole-webgpu",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Gravitational lensing around a Schwarzschild black hole, ported to TypeScript + WebGPU",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.74",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1",
+    "vitest": "^5.0.2"
+  }
+}
