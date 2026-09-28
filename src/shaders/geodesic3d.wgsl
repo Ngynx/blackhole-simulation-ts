@@ -3,7 +3,8 @@
 // This is a line-by-line transcription of src/physics/geodesic3d.ts, which is
 // where the equations are proved (vitest cannot execute WGSL). If you change
 // one, change the other -- they are meant to be the same integrator. The disk
-// plane-crossing test below is likewise mirrored by diskCrossing() there.
+// plane-crossing test and the star segment/sphere test below are likewise
+// mirrored by diskCrossing() and segmentSphereHit() there.
 //
 // Units: every length is in Schwarzschild radii (rs = 1). See the header of
 // src/physics/constants.ts for why SI numbers cannot survive f32.
@@ -26,6 +27,24 @@ struct Camera {
 
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(0) @binding(1) var outputTex: texture_storage_2d<rgba8unorm, write>;
+
+// --- Background objects ----------------------------------------------------
+//
+// The two static stars of the reference, packed by packStars() in
+// src/physics/stars.ts. They are uniform data rather than WGSL constants so
+// the geometry has exactly one source of truth on the CPU side; the only thing
+// this shader has to agree on is the count.
+
+struct Star {
+  // xyz: centre in rs, w: radius in rs
+  posRadius: vec4<f32>,
+  // rgb: base colour, w: opaque alpha (stored, never read)
+  color: vec4<f32>,
+};
+
+const STAR_COUNT: i32 = 2;
+
+@group(0) @binding(2) var<uniform> objects: array<Star, STAR_COUNT>;
 
 // --- Geometry of the problem, all in units of rs -------------------------
 
@@ -99,6 +118,53 @@ fn perpendicular(n: vec3<f32>) -> vec3<f32> {
 // the integrator's state never comes near 1e30 in units of rs.
 fn finiteF32(x: f32) -> bool {
   return abs(x) < 1e30;
+}
+
+// Entry point of the segment prev -> next into the sphere, with a hit flag in
+// .w (1 = hit, 0 = miss) because WGSL has no nullable type. .xyz is the entry
+// point, or prev when prev already lies inside.
+//
+// WHY A SEGMENT AND NOT AN ENDPOINT
+// ---------------------------------
+// The reference tests distance(P, center) <= radius at the ENDPOINT of every
+// step and gets away with it because it marches with a fixed D_LAMBDA of 1e7 m
+// = 7.9e-4 rs. We cannot: our step is adaptive, h = clamp(0.1 r, 0.02, 12),
+// and the stars sit at exactly ten times their own radius, so at their
+// distance the step comes out to h = 0.1 * STAR_ORBIT = STAR_RADIUS -- one
+// step equals one star radius. An endpoint test then loses every chord
+// shorter than a step, i.e. the outer band of the projected disc (chord < h
+// <=> impact parameter > sqrt(3)/2 * radius), roughly a quarter of the area:
+// the rim would erode and flicker as the sample phase moved with the camera.
+// Testing the whole segment is exact for a straight chord and independent of
+// step length. geodesic3d.ts carries the same function with a proof.
+fn segmentSphereHit(prev: vec3<f32>, next: vec3<f32>, center: vec3<f32>, radius: f32) -> vec4<f32> {
+  let d = next - prev;
+  let m = prev - center;
+  let a = dot(d, d);
+  let b = 2.0 * dot(m, d);
+  let c = dot(m, m) - radius * radius;
+
+  // prev already inside: the quadratic roots would both be negative.
+  if (c <= 0.0) {
+    return vec4<f32>(prev, 1.0);
+  }
+  // Degenerate segment: a point, and it is outside by the check above.
+  if (a <= 0.0) {
+    return vec4<f32>(prev, 0.0);
+  }
+
+  let disc = b * b - 4.0 * a * c;
+  if (disc < 0.0) {
+    return vec4<f32>(prev, 0.0);
+  }
+
+  // c > 0 and a > 0 make the roots share a sign (product = c/a), so the
+  // smaller one is the entry point whenever the sphere lies ahead at all.
+  let t = (-b - sqrt(disc)) / (2.0 * a);
+  if (t < 0.0 || t > 1.0) {
+    return vec4<f32>(prev, 0.0);
+  }
+  return vec4<f32>(prev + t * d, 1.0);
 }
 
 // --- Background -------------------------------------------------------------------------------------------------------------------
@@ -193,6 +259,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // did. The integrator only knows r and phi inside the orbital plane, so the
   // cartesian point is rebuilt from the basis every step to test the plane.
   var diskHit = -1.0;
+  // Index of the star the ray struck, negative when it struck none, plus the
+  // surface entry point (needed for the shading normal).
+  var starHit = -1;
+  var starPoint = vec3<f32>(0.0);
   var prevPos = origin;
   for (var i: i32 = 0; i < MAX_STEPS; i = i + 1) {
     if (y.x <= CAPTURE_R) {
@@ -229,6 +299,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         break;
       }
     }
+
+    // Stars, tested after the disk exactly as the reference orders them
+    // (capture -> disk -> object). The whole segment is tested, not just the
+    // endpoint -- see segmentSphereHit() above for why an endpoint test cannot
+    // work at our step size. The two stars are far apart, so a ray can only
+    // ever reach one of them; last write would be harmless either way.
+    var starIdx = -1;
+    var starEntry = vec3<f32>(0.0);
+    for (var s: i32 = 0; s < STAR_COUNT; s = s + 1) {
+      let center = objects[s].posRadius.xyz;
+      let entry = segmentSphereHit(prevPos, pos, center, objects[s].posRadius.w);
+      if (entry.w > 0.5) {
+        starIdx = s;
+        starEntry = entry.xyz;
+      }
+    }
+    if (starIdx >= 0) {
+      starHit = starIdx;
+      starPoint = starEntry;
+      break;
+    }
+
     prevPos = pos;
   }
 
@@ -259,6 +351,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = clamp(diskHit / DISK_R2, 0.0, 1.0);
     col = vec3<f32>(1.0, t, 0.2);
     mask = t;
+  } else if (starHit >= 0) {
+    // Reference shading (geodesic.comp): Lambert against the VIEW direction,
+    // ambient 0.1, so a star limb-shades towards its silhouette instead of
+    // reading as a flat coloured disc. N points out of the surface because the
+    // entry point sits on the sphere around hitCenter.
+    let star = objects[starHit];
+    let n = normalize(starPoint - star.posRadius.xyz);
+    let v = normalize(cam.posTan.xyz - starPoint);
+    let intensity = 0.1 + 0.9 * max(dot(n, v), 0.0);
+    col = star.color.rgb * intensity;
+    // mask = 0: a star sits at ~31.5 rs, well BEYOND the Flamm lattice (which
+    // spans +-9.9 rs), so the wireframe is the nearer surface and draws over
+    // it. The shadow and the disk sit nearer than the lattice and suppress it
+    // instead -- same rule, opposite sign.
+    mask = 0.0;
   } else {
     // Rays that exhaust the step budget are near-critical (they wind around
     // the photon sphere). Sampling the sky with their current heading keeps the

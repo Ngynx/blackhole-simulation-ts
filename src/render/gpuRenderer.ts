@@ -2,6 +2,7 @@ import blitCode from '../shaders/blit.wgsl?raw';
 import geodesicCode from '../shaders/geodesic3d.wgsl?raw';
 import gridCode from '../shaders/grid.wgsl?raw';
 import { buildFlammMesh } from '../physics/flamm';
+import { packStars, STAR_FLOATS, STARS } from '../physics/stars';
 import { configureCanvasContext, resizeCanvasToDisplaySize } from './webgpu';
 import { buildViewProjection } from './viewProjection';
 
@@ -129,6 +130,18 @@ export async function createGpuRenderer(
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
+  // The stars are static (the reference leaves its N-body pass switched off),
+  // so they are uploaded once at creation with mappedAtCreation -- the same
+  // treatment the Flamm mesh gets -- and never rewritten.
+  const objectsBuffer = device.createBuffer({
+    label: 'objects',
+    size: STARS.length * STAR_FLOATS * 4,
+    usage: GPUBufferUsage.UNIFORM,
+    mappedAtCreation: true,
+  });
+  new Float32Array(objectsBuffer.getMappedRange()).set(packStars());
+  objectsBuffer.unmap();
+
   // Uploaded with mappedAtCreation so no staging buffer is needed: the mesh
   // is static, built once on the CPU.
   const mesh = buildFlammMesh();
@@ -196,6 +209,7 @@ export async function createGpuRenderer(
       entries: [
         { binding: 0, resource: { buffer: cameraBuffer } },
         { binding: 1, resource: view },
+        { binding: 2, resource: { buffer: objectsBuffer } },
       ],
     });
     blitBindGroup = device.createBindGroup({
@@ -344,6 +358,7 @@ export async function createGpuRenderer(
     destroy() {
       texture?.destroy();
       cameraBuffer.destroy();
+      objectsBuffer.destroy();
       gridVertexBuffer.destroy();
       gridIndexBuffer.destroy();
       gridUniformBuffer.destroy();

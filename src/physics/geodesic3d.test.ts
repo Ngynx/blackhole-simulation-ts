@@ -11,11 +11,13 @@ import {
   initPlaneRay,
   marchPlaneRay,
   planePosition,
+  segmentSphereHit,
   stepPlaneRay,
   stepSizeFor,
   velocityDirection,
   type Vec3,
 } from './geodesic3d';
+import { STAR_ORBIT, STAR_RADIUS, STARS } from './stars';
 
 /**
  * Numerical tests for the 3D geodesic integrator.
@@ -255,6 +257,95 @@ describe('diskCrossing', () => {
   });
 });
 
+describe('segmentSphereHit', () => {
+  const center = STARS[0].pos;
+  const radius = STARS[0].radius;
+
+  /** Distance from `p` to the star centre. */
+  function dist(p: Vec3): number {
+    return Math.hypot(p[0] - center[0], p[1] - center[1], p[2] - center[2]);
+  }
+
+  it('takes one adaptive step to span exactly one star radius', () => {
+    // The arithmetic the whole segment test exists for. The stars sit at 4e11 m
+    // with 4e10 m radii, so STAR_ORBIT = 10 * STAR_RADIUS, and the adaptive
+    // step at that distance is 0.1 * STAR_ORBIT -- the same number.
+    //
+    // If STEP_FRACTION ever changes, this fails first and says why: an
+    // endpoint test stops being merely lossy and the numbers below stop
+    // describing reality.
+    expect(STAR_ORBIT).toBeCloseTo(10 * STAR_RADIUS, 12);
+    expect(stepSizeFor(STAR_ORBIT)).toBeCloseTo(STAR_RADIUS, 10);
+  });
+
+  it('detects a grazing chord whose endpoints both lie outside', () => {
+    // Regression for the endpoint-sampling failure mode. One adaptive step of
+    // length h = STAR_RADIUS, offset to b = 0.95 R: the chord inside the
+    // sphere is only 2*sqrt(R^2 - b^2) = 0.62 R long, so both endpoints fall
+    // outside. The reference's distance(P, center) <= radius would miss it,
+    // eroding that outer band of the projected disc and flickering as the
+    // sample phase moved with the camera.
+    const h = stepSizeFor(STAR_ORBIT);
+    const b = 0.95 * radius;
+    const x = center[0] + b;
+    const prev: Vec3 = [x, 0, -h / 2];
+    const next: Vec3 = [x, 0, h / 2];
+
+    // Both endpoints outside the sphere: this is what an endpoint test sees.
+    expect(dist(prev)).toBeGreaterThan(radius);
+    expect(dist(next)).toBeGreaterThan(radius);
+    // ...and the segment still crosses it.
+    expect(segmentSphereHit(prev, next, center, radius)).not.toBeNull();
+  });
+
+  it('hits a segment passing through the centre, on the surface', () => {
+    const prev: Vec3 = [center[0] - 10, 0, 0];
+    const next: Vec3 = [center[0] + 10, 0, 0];
+    const hit = segmentSphereHit(prev, next, center, radius);
+    expect(hit).not.toBeNull();
+    // Entry point is one radius before the centre, and it lies on the sphere.
+    expect(hit![0]).toBeCloseTo(center[0] - radius, 10);
+    expect(dist(hit!)).toBeCloseTo(radius, 10);
+  });
+
+  it('misses a segment that passes beside the sphere', () => {
+    const x = center[0] + radius + 0.5;
+    expect(segmentSphereHit([x, 0, -10], [x, 0, 10], center, radius)).toBeNull();
+  });
+
+  it('misses a sphere that lies behind the segment', () => {
+    // Both roots of the quadratic are negative when the sphere is backwards
+    // along the segment, so the smaller one never lands in [0, 1].
+    const x = center[0] + 10;
+    expect(segmentSphereHit([x, 0, 0], [x + 10, 0, 0], center, radius)).toBeNull();
+  });
+
+  it('treats a segment that starts inside as a hit at its start', () => {
+    const inside: Vec3 = [center[0], 0, 0];
+    expect(segmentSphereHit(inside, [center[0] + 1, 0, 0], center, radius)).toEqual(inside);
+  });
+
+  it('misses a degenerate segment outside the sphere', () => {
+    const outside: Vec3 = [center[0] + radius + 1, 0, 0];
+    expect(segmentSphereHit(outside, outside, center, radius)).toBeNull();
+  });
+
+  it('finds the star whatever the step length is', () => {
+    // The adaptive step varies with r, so the answer must not depend on it.
+    // Same grazing geometry as above, sampled once with a single step and once
+    // with a segment twenty times longer.
+    const b = 0.95 * radius;
+    const x = center[0] + b;
+    const h = stepSizeFor(STAR_ORBIT);
+    const oneStep = segmentSphereHit([x, 0, -h / 2], [x, 0, h / 2], center, radius);
+    const longRun = segmentSphereHit([x, 0, -10 * h], [x, 0, 10 * h], center, radius);
+    expect(oneStep).not.toBeNull();
+    expect(longRun).not.toBeNull();
+    // Both report the same closest approach to within interpolation error.
+    expect(dist(oneStep!)).toBeCloseTo(dist(longRun!), 6);
+  });
+});
+
 describe('shader constant parity', () => {
   const shader = shaderSource;
 
@@ -277,5 +368,12 @@ describe('shader constant parity', () => {
 
   it('keeps the march budget in sync with the CPU reference', () => {
     expect(wgslConst('MAX_STEPS')).toBe(600);
+  });
+
+  it('keeps the star count in sync with the CPU list', () => {
+    // The shader sizes its uniform array from STAR_COUNT while the CPU packs
+    // STARS, so the two must agree or the buffer and the array disagree about
+    // how many stars exist.
+    expect(wgslConst('STAR_COUNT')).toBe(STARS.length);
   });
 });
