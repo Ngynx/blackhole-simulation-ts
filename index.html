@@ -7,6 +7,26 @@
     <style>
       :root {
         color-scheme: dark;
+
+        /* Page chrome colours -- one custom property per Style.ui field
+           (src/render/style.ts). The values below are REALISTIC.ui verbatim,
+           so the default load renders byte-identically to the hard-coded
+           colours this block replaced; uiStyle.test.ts parses this file and
+           fails if they ever drift. applyUiStyle() (src/render/uiStyle.ts)
+           rewrites all of them from the active style at startup and on every
+           s/c switch.
+
+           --bh-panel-veil is --bh-panel at 92% alpha: the status banner
+           floats over the canvas and stays slightly translucent, exactly as
+           the old rgba(10, 12, 18, 0.92) literal did. */
+        --bh-background: #05070c;
+        --bh-panel: #0a0c12;
+        --bh-panel-veil: rgba(10, 12, 18, 0.92);
+        --bh-border: #1d222d;
+        --bh-text: #8b93a7;
+        --bh-muted: #4d5568;
+        --bh-ok: #57d99a;
+        --bh-fail: #ff7b72;
       }
       * {
         box-sizing: border-box;
@@ -16,7 +36,7 @@
         margin: 0;
         height: 100%;
         overflow: hidden;
-        background: #05070c;
+        background: var(--bh-background);
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       }
       #view {
@@ -36,19 +56,22 @@
         padding: 6px 12px;
         font-size: 12px;
         letter-spacing: 0.02em;
-        background: rgba(10, 12, 18, 0.92);
-        border-bottom: 1px solid #1d222d;
-        color: #8b93a7;
+        background: var(--bh-panel-veil);
+        border-bottom: 1px solid var(--bh-border);
+        color: var(--bh-text);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
       }
+      /* The two border accents below are the only chrome colours outside
+         Style.ui: static companions of the ok/fail text, kept as literals on
+         purpose (they are not part of the styled palette). */
       #status.ok {
-        color: #57d99a;
+        color: var(--bh-ok);
         border-bottom-color: #16352a;
       }
       #status.fail {
-        color: #ff7b72;
+        color: var(--bh-fail);
         border-bottom-color: #3d1f1d;
       }
 
@@ -62,8 +85,8 @@
         align-items: center;
         justify-content: center;
         padding: 32px;
-        background: #05070c;
-        color: #ff7b72;
+        background: var(--bh-background);
+        color: var(--bh-fail);
         font-size: 15px;
         line-height: 1.6;
         text-align: center;
@@ -78,7 +101,7 @@
         bottom: 10px;
         z-index: 10;
         font-size: 11px;
-        color: #4d5568;
+        color: var(--bh-muted);
         pointer-events: none;
       }
     </style>

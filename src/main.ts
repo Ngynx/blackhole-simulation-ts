@@ -1,5 +1,6 @@
 import { createLensing2D } from './modes/lensing2d';
 import { createLensing3d } from './modes/lensing3d';
+import { initialStyleFrom, styleWarningNote, type QueryLike } from './render/styleSelect';
 import { probeWebGPU, type WebGPUProbe } from './render/webgpu';
 
 const statusEl = document.getElementById('status');
@@ -18,8 +19,8 @@ const canvas = requireCanvas('view');
 
 /** Which simulation mode the URL asks for. Unknown values fall back to 2D. */
 type Mode = '2d' | '3d';
-function requestedMode(): { mode: Mode; known: boolean } {
-  const raw = new URLSearchParams(window.location.search).get('mode');
+function requestedMode(params: QueryLike): { mode: Mode; known: boolean } {
+  const raw = params.get('mode');
   if (raw === '3d') return { mode: '3d', known: true };
   if (raw === '2d') return { mode: '2d', known: true };
   if (raw === null) return { mode: '2d', known: true };
@@ -50,10 +51,18 @@ function showFallback(reason: string): void {
 }
 
 async function main(): Promise<void> {
-  const { mode, known } = requestedMode();
+  const params = new URLSearchParams(window.location.search);
+  const { mode, known } = requestedMode(params);
   const probe = await probeWebGPU();
 
+  // Style selection is 3D-mode only: the 2D canvas draws without style
+  // uniforms, so `?style=` is meaningless there -- and so is a warning about
+  // one. An invalid value still never crashes: initialStyleFrom() has already
+  // fallen back to the default and only reports `known: false`.
+  const initialStyle = initialStyleFrom(params);
+
   let note = !known ? ' Unknown mode value — falling back to 2D.' : '';
+  note += styleWarningNote(mode, initialStyle.known);
   setStatus(probe, note);
 
   if (mode === '3d') {
@@ -65,11 +74,17 @@ async function main(): Promise<void> {
     // The self-check readback is opt-in: it costs one texture round-trip and
     // exists purely so the headless verification harness can measure the
     // shadow radius without parsing a screenshot.
-    const selfCheck = new URLSearchParams(window.location.search).get('check') === '1';
-    if (hintEl) hintEl.textContent = 'drag: orbit · wheel: zoom · r: reset view';
+    const selfCheck = params.get('check') === '1';
 
     try {
-      await createLensing3d(canvas, probe.device, { selfCheck });
+      // createLensing3d owns the style from here on: it hands the preset to
+      // the renderer, applies the chrome and keeps the hint in sync while the
+      // s/c keys switch styles.
+      await createLensing3d(canvas, probe.device, {
+        selfCheck,
+        style: initialStyle.style,
+        hint: hintEl,
+      });
     } catch (err) {
       showFallback(err instanceof Error ? err.message : String(err));
     }

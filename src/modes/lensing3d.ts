@@ -1,4 +1,7 @@
 import { createGpuRenderer, type CameraState, type GpuRenderer } from '../render/gpuRenderer';
+import { nextStyle, toggleCrt } from '../render/styleSelect';
+import { applyUiStyle } from '../render/uiStyle';
+import type { Style } from '../render/style';
 
 /**
  * Phase 2: 3D lensing rendered by a WGSL compute shader.
@@ -29,9 +32,9 @@ const DEFAULT_AZIMUTH = -0.55;
  *
  * The shadow's *intrinsic* silhouette does not depend on elevation -- it is
  * spherical -- but the shadow we can see does: the near side of the disk
- * occludes it, and how much it covers depends on the viewing angle. That is
- * also why the self-check's SHADOW_DIAMETER moved from 144 to 118 when this
- * was raised; see the note there.
+ * occludes it, and how much it covers depends on the viewing angle. So the
+ * self-check's SHADOW_DIAMETER is not a fixed figure either; see the note
+ * there for what it actually measures and reports.
  */
 const DEFAULT_ELEVATION = 0.5;
 
@@ -49,6 +52,24 @@ const MAX_ELEVATION = (85 * Math.PI) / 180;
 
 const WORLD_UP: readonly [number, number, number] = [0, 1, 0];
 
+/**
+ * The on-screen key-binding hint for 3D mode, built from the active style so
+ * it always names that style and documents what `c` means for it.
+ *
+ * Product choice, stated on screen as well as here: `s` switches presets, `c`
+ * toggles only the CRT layer (scanlines + vignette) while the retro core
+ * (palette + dither) is left alone -- and in `realistic`, which ships no core
+ * flags, `c` deliberately does nothing ("retro only"), because switching the
+ * CRT flags on over a non-quantised image is a look no preset asked for.
+ */
+export function lensing3dHint(style: Style): string {
+  const crt =
+    style.post.palette || style.post.dither
+      ? 'c: crt (scanlines+vignette, palette+dither stay)'
+      : 'c: crt (retro only)';
+  return `drag: orbit · wheel: zoom · r: reset view · s: style (${style.name}) · ${crt}`;
+}
+
 export interface Lensing3D {
   destroy(): void;
   resize(): void;
@@ -62,6 +83,16 @@ interface Options {
    * opt-in via `?check=1`.
    */
   selfCheck?: boolean;
+  /**
+   * The style selected at startup (main.ts resolves `?style=` through
+   * `initialStyleFrom`). Required: the caller owns selection, this mode owns
+   * application -- the renderer, the page chrome and the hint all start from
+   * exactly this object.
+   */
+  style: Style;
+  /** The hint element (`#hint`). This mode keeps its text in sync with the
+   *  active style on every switch; omitted, the hint simply stays as it is. */
+  hint?: HTMLElement | null;
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -115,9 +146,20 @@ function buildCamera(
 export async function createLensing3d(
   canvas: HTMLCanvasElement,
   device: GPUDevice,
-  options: Options = {},
+  options: Options,
 ): Promise<Lensing3D> {
-  const renderer: GpuRenderer = await createGpuRenderer(device, canvas);
+  // Single owner of "what the app looks like right now". Every switch goes
+  // through activateStyle() below, so renderer uniforms, page chrome, hint
+  // text and render scale can never disagree about the current style.
+  let currentStyle: Style = options.style;
+  const renderer: GpuRenderer = await createGpuRenderer(device, canvas, currentStyle);
+
+  // Page chrome + hint start from the same style the renderer got. The values
+  // applyUiStyle() writes here equal index.html's :root declarations (locked
+  // by uiStyle.test.ts), so the default load renders unchanged -- doing it
+  // anyway keeps one code path responsible for the chrome on every switch.
+  applyUiStyle(currentStyle);
+  if (options.hint) options.hint.textContent = lensing3dHint(currentStyle);
 
   // Declared before any helper runs: resetCamera() marks the first frame dirty.
   let dirty = true;
@@ -139,6 +181,24 @@ export async function createLensing3d(
     dirty = true;
   }
 
+  /**
+   * Applies a style everywhere it is visible: renderer uniforms + offscreen
+   * retarget (`setStyle`), page chrome (`applyUiStyle`), hint text, redraw.
+   *
+   * An identity switch is skipped on purpose: `toggleCrt` returns the SAME
+   * object for `c` in the realistic style (no CRT core to toggle), so the
+   * no-op never rewrites a buffer, never re-sets a CSS property and never
+   * touches the frame.
+   */
+  function activateStyle(next: Style): void {
+    if (next === currentStyle) return;
+    currentStyle = next;
+    renderer.setStyle(next);
+    applyUiStyle(next);
+    if (options.hint) options.hint.textContent = lensing3dHint(next);
+    requestRedraw();
+  }
+
   let checked = false;
 
   function frame(): void {
@@ -150,20 +210,28 @@ export async function createLensing3d(
 
       if (options.selfCheck && !checked) {
         checked = true;
-        void renderer.measureShadowDiameter().then((diameter) => {
+        void renderer.measureShadowDiameterCanvasPx().then((diameter) => {
           // Single greppable line: the headless harness reads this from the
           // browser console instead of parsing a PNG.
           //
           // This measures the *visible* black run on the centre row of the
-          // compute texture, not the capture silhouette. Before the disk
-          // existed it was that silhouette (144 px against 147 predicted).
-          // Now the disk's near side covers part of it -- and, per the
-          // reference's loop order, a photon that crosses the disk annulus
-          // before it reaches the capture radius is reported as disk rather
-          // than as captured, exactly as geodesic.comp's `hitDisk` break does.
-          // So 118 px is the expected figure, not a regression: it is roughly
-          // the disk's inner edge (2.2 rs) projected at distance 40 rs, which
-          // is 121 px by the same arithmetic the 147 was derived from.
+          // compute texture, not the capture silhouette: a count across the
+          // middle row of the shadow, in CANVAS pixels. Per the reference's
+          // loop order a photon that crosses the disk annulus before it
+          // reaches the capture radius is reported as disk rather than as
+          // captured (geodesic.comp's `hitDisk` break), and the disk's near
+          // side covers part of the silhouette as well -- so the run is
+          // shorter than the capture diameter, and it is NOT a fixed figure.
+          //
+          // The count is viewport-dependent: it scales with the canvas the
+          // browser gives us, so there is no single expected number to pin.
+          // The `?check=1` harness reports what was actually measured. In a
+          // 756x469 headless viewport it reads 84, at renderScale 1 and at
+          // the retro preset's 0.25 alike.
+          //
+          // The unit is CANVAS pixels at any renderScale: the renderer counts
+          // storage texels and converts at its API boundary, so the reported
+          // value stays comparable while the retro preset renders at 0.25.
           console.log(`SHADOW_DIAMETER=${diameter}`);
         });
       }
@@ -207,7 +275,17 @@ export async function createLensing3d(
   };
 
   const onKeyDown = (e: KeyboardEvent): void => {
-    if (e.key === 'r' || e.key === 'R') resetCamera();
+    if (e.key === 'r' || e.key === 'R') {
+      resetCamera();
+    } else if (e.key === 's' || e.key === 'S') {
+      // Style toggle, 3D mode only: lensing2d.ts owns its own key handling
+      // and knows nothing about styles.
+      activateStyle(nextStyle(currentStyle));
+    } else if (e.key === 'c' || e.key === 'C') {
+      // CRT layer only (scanlines + vignette); the retro core stays as-is,
+      // and in the realistic style this is a documented no-op.
+      activateStyle(toggleCrt(currentStyle));
+    }
   };
 
   const observer = new ResizeObserver(() => requestRedraw());

@@ -46,6 +46,29 @@ const STAR_COUNT: i32 = 2;
 
 @group(0) @binding(2) var<uniform> objects: array<Star, STAR_COUNT>;
 
+// --- Presentation style ---------------------------------------------------
+//
+// The sky's look comes from the active Style preset (src/render/style.ts)
+// rather than literals, so a different preset can be selected later without
+// editing this file. Physics never reads a Style: only skyColor() below is
+// parameterised.
+//
+// LAYOUT (WGSL uniform address space, 16-byte alignment): every member is a
+// vec4<f32>, so the struct is three packed vec4s with no implicit padding and
+// no member needs an explicit @align/@size attribute. Byte offsets are
+// mirrored by buildSkyStyleUniform() in src/render/styleUniforms.ts:
+//   offset 0   lowGrid    rgb = gradient low colour,  a = grid strength
+//   offset 16  highStars  rgb = gradient high colour, a = procedural stars
+//                         (1 = on, 0 off)
+//   offset 32  gridTint   rgb = celestial grid tint,  a = reserved, always 0
+struct SkyStyleUniform {
+  lowGrid: vec4<f32>,
+  highStars: vec4<f32>,
+  gridTint: vec4<f32>,
+};
+
+@group(0) @binding(3) var<uniform> skyStyle: SkyStyleUniform;
+
 // --- Geometry of the problem, all in units of rs -------------------------
 
 const RS: f32 = 1.0;
@@ -183,28 +206,34 @@ fn skyColor(dIn: vec3<f32>) -> vec3<f32> {
   let d = normalize(dIn);
 
   // Dim vertical gradient -- pure black would leave nothing to distort.
-  var col = mix(vec3<f32>(0.010, 0.016, 0.034), vec3<f32>(0.026, 0.040, 0.070), 0.5 + 0.5 * d.y);
+  var col = mix(skyStyle.lowGrid.rgb, skyStyle.highStars.rgb, 0.5 + 0.5 * d.y);
 
-  // Meridians and parallels every 15 degrees.
+  // Meridians and parallels every 15 degrees. The strength scalar is part of
+  // the style (0 disables the grid); with the default preset it is exactly
+  // 1.0, and multiplying by 1.0f is exact, so the result is bit-identical to
+  // the previous literal expression.
   let lon = atan2(d.z, d.x);
   let lat = asin(clamp(d.y, -1.0, 1.0));
   let dLon = SKY_GRID * abs(fract(lon / SKY_GRID + 0.5) - 0.5);
   let dLat = SKY_GRID * abs(fract(lat / SKY_GRID + 0.5) - 0.5);
   let grid = max(smoothstep(0.007, 0.0, dLon), smoothstep(0.007, 0.0, dLat));
-  col += vec3<f32>(0.030, 0.075, 0.120) * grid;
+  col += skyStyle.gridTint.rgb * (skyStyle.lowGrid.a * grid);
 
   // One candidate star per cell of a lattice laid over the sphere; a fourth,
   // independent hash decides whether the cell has a star at all so brightness
-  // stays uncorrelated with position.
-  let n = 90.0;
-  let cell = floor(d * n);
-  let sel = hash13(cell + vec3<f32>(113.0, 271.0, 397.0));
-  if (sel > 0.88) {
-    let pos = vec3<f32>(hash13(cell), hash13(cell + 17.0), hash13(cell + 43.0));
-    let local = d * n - cell;
-    let dist = length(local - (0.2 + 0.6 * pos));
-    let mag = (sel - 0.88) / 0.12;
-    col += vec3<f32>(0.85, 0.90, 1.0) * smoothstep(0.30, 0.0, dist) * mag * 1.4;
+  // stays uncorrelated with position. The whole lattice is gated on the
+  // style's procedural-star switch, which the default preset keeps on.
+  if (skyStyle.highStars.w > 0.5) {
+    let n = 90.0;
+    let cell = floor(d * n);
+    let sel = hash13(cell + vec3<f32>(113.0, 271.0, 397.0));
+    if (sel > 0.88) {
+      let pos = vec3<f32>(hash13(cell), hash13(cell + 17.0), hash13(cell + 43.0));
+      let local = d * n - cell;
+      let dist = length(local - (0.2 + 0.6 * pos));
+      let mag = (sel - 0.88) / 0.12;
+      col += vec3<f32>(0.85, 0.90, 1.0) * smoothstep(0.30, 0.0, dist) * mag * 1.4;
+    }
   }
   return col;
 }
