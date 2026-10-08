@@ -34,6 +34,13 @@ export const NEAR = 0.1;
 /** Far plane in rs. The lattice spans ~10 rs and the camera sits at ~40. */
 export const FAR = 1000;
 
+/**
+ * Floats the grid uniform holds: exactly one `mat4x4<f32>` (the WGSL `Params`
+ * struct in grid.wgsl). gpuRenderer sizes its buffer from this, and the
+ * layout-parity test checks the parsed struct against it.
+ */
+export const VIEW_PROJECTION_FLOATS = 16;
+
 function dot(a: readonly number[], b: readonly [number, number, number]): number {
   return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }

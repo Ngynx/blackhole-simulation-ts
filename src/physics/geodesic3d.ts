@@ -264,6 +264,62 @@ export function diskCrossing(prev: Vec3, next: Vec3): number {
 }
 
 /**
+ * Entry point of the segment `prev -> next` into the sphere, or null when the
+ * segment misses it entirely.
+ *
+ * CPU twin of segmentSphereHit() in geodesic3d.wgsl (WGSL has no nullable
+ * type, so the shader returns vec4 and carries a hit flag in .w; the maths is
+ * identical).
+ *
+ * WHY A SEGMENT AND NOT AN ENDPOINT
+ * ---------------------------------
+ * The reference tests `distance(P, center) <= radius` at the ENDPOINT of every
+ * step and gets away with it because it marches with a fixed D_LAMBDA of 1e7 m
+ * = 7.9e-4 rs. We cannot: our step is adaptive, h = clamp(0.1 r, 0.02, 12),
+ * and the stars sit at 4e11 m = exactly ten times their own radius, so at
+ * their distance the step comes out to
+ *
+ *     h = 0.1 * STAR_ORBIT = STAR_RADIUS
+ *
+ * -- one step equals one star radius. An endpoint test then loses every chord
+ * shorter than a step, which is the outer band of the projected disc
+ * (chord < h  <=>  impact parameter > sqrt(3)/2 * radius), about a quarter of
+ * the area. The rim would erode and flicker as the phase of the samples
+ * changed with the camera. Testing the whole segment is exact for a straight
+ * chord, independent of step length, and there is a regression test below
+ * pinning that case.
+ *
+ * Solving |prev + t d - center|^2 = radius^2 for t in [0, 1] is the usual
+ * quadratic. When `prev` is already inside, c <= 0 and every t would be
+ * negative, so that case is returned directly as a hit at `prev`.
+ */
+export function segmentSphereHit(prev: Vec3, next: Vec3, center: Vec3, radius: number): Vec3 | null {
+  const dx = next[0] - prev[0];
+  const dy = next[1] - prev[1];
+  const dz = next[2] - prev[2];
+  const mx = prev[0] - center[0];
+  const my = prev[1] - center[1];
+  const mz = prev[2] - center[2];
+
+  const a = dx * dx + dy * dy + dz * dz;
+  const b = 2 * (mx * dx + my * dy + mz * dz);
+  const c = mx * mx + my * my + mz * mz - radius * radius;
+
+  if (c <= 0) return prev;
+  if (a <= 0) return null;
+
+  const disc = b * b - 4 * a * c;
+  if (disc < 0) return null;
+
+  // With c > 0 and a > 0 the two roots share a sign (product = c/a), so the
+  // smaller one is the entry point whenever the sphere is ahead at all.
+  const t = (-b - Math.sqrt(disc)) / (2 * a);
+  if (t < 0 || t > 1) return null;
+
+  return [prev[0] + t * dx, prev[1] + t * dy, prev[2] + t * dz];
+}
+
+/**
  * Unit vector along the photon's VELOCITY, i.e. the direction the light ray is
  * actually travelling in coordinate space.
  *
